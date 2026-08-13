@@ -5,6 +5,7 @@ import asyncio
 import os
 import glob
 import logging
+import subprocess
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -15,169 +16,102 @@ BOT_TOKEN = "8985271005:AAH82tnFSk65QgOF6k6tZaokqmN6-H1Usjg"
 client = TelegramClient('bot_session', API_ID, API_HASH)
 
 user_states = {}
+# Словарь для хранения активных процессов запущенных ботов: {user_id: subprocess.Popen}
+active_bot_processes = {}
 
-def get_main_menu():
-    return ReplyKeyboardMarkup(
-        rows=[
-            KeyboardButtonRow([KeyboardButton(text="👤 Профили"), KeyboardButton(text="⚡ Рассылка")]),
-            KeyboardButtonRow([KeyboardButton(text="💬 Сообщения"), KeyboardButton(text="👥 Группы")]),
-            KeyboardButtonRow([KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройки")]),
-            KeyboardButtonRow([KeyboardButton(text="💎 Подписка"), KeyboardButton(text="❓ Поддержка")]),
-        ],
-        resize=True
-    )
+def get_main_menu(is_admin=False):
+    rows = [
+        KeyboardButtonRow([KeyboardButton(text="👤 Профили"), KeyboardButton(text="⚡ Рассылка")]),
+        KeyboardButtonRow([KeyboardButton(text="💬 Сообщения"), KeyboardButton(text="👥 Группы")]),
+        KeyboardButtonRow([KeyboardButton(text="🤖 Создать своего бота"), KeyboardButton(text="⚙️ Настройки")]),
+        KeyboardButtonRow([KeyboardButton(text="💎 Подписка"), KeyboardButton(text="❓ Поддержка")]),
+    ]
+    if is_admin:
+        rows.append(KeyboardButtonRow([KeyboardButton(text="🛠 Админ-панель")]))
+    return ReplyKeyboardMarkup(rows=rows, resize=True)
 
 @client.on(events.NewMessage(pattern=lambda e: e.raw_text == '/start'))
 async def start(event):
+    user_id = event.sender_id
+    is_admin = user_id == 2040  # Ваш ID
+    
     await event.respond(
-        "👋 Добро пожаловать в Автохост | Управление проектами!\nВыберите нужный пункт меню:",
-        buttons=get_main_menu()
+        "🤖 **Добро пожаловать в CisAuto (Автохост)!**\nУправляйте своими ботами и загружайте обновления.",
+        buttons=get_main_menu(is_admin=is_admin)
     )
 
-@client.on(events.NewMessage(pattern=lambda e: e.raw_text == '👤 Профили'))
-async def profiles_menu(event):
+@client.on(events.NewMessage(pattern=lambda e: e.raw_text == '🤖 Создать своего бота'))
+async def host_bot_menu(event):
     user_id = event.sender_id
+    user_states[user_id] = {'step': 'waiting_bot_file'}
     
-    session_files = glob.glob(f"session_{user_id}_*.session")
-    
-    text = "👤 **Управление профилями (аккаунтами):**\n\n"
-    inline_buttons = []
-    
-    if session_files:
-        text += "Подключенные аккаунты:\n"
-        for sf in session_files:
-            phone_num = sf.replace(f"session_{user_id}_", "").replace(".session", "")
-            inline_buttons.append([Button.inline(f"📱 {phone_num} (Активен)", data=f"sel_{phone_num}".encode())])
-    else:
-        text += "У вас пока не добавлено ни одного аккаунта.\n"
+    text = (
+        "🤖 **Автохост ботов:**\n\n"
+        "Отправьте мне файл вашего бота (`.py`), чтобы разместить его на хосте или обновить уже существующий.\n"
+        "⚠️ *Если файл с таким именем уже существовал, старая версия будет полностью остановлена, а код заменен на новый.*"
+    )
+    await event.respond(text, buttons=get_main_menu())
 
-    inline_buttons.append([Button.inline("➕ Добавить еще аккаунт", b"add_phone")])
-    inline_buttons.append([Button.inline("⬅️ Назад в меню", b"back_to_menu")])
-
-    await event.respond(text, buttons=inline_buttons)
-
-@client.on(events.CallbackQuery(data=b'add_phone'))
-async def add_phone_cb(event):
-    user_id = event.sender_id
-    user_states[user_id] = {'step': 'waiting_phone'}
-    await event.edit("📱 Введите номер нового аккаунта в международном формате (например, `+79991234567`):")
-
-@client.on(events.CallbackQuery(data=b'back_to_menu'))
-async def back_menu_cb(event):
-    await event.edit("Главное меню:")
-    await event.respond("Выберите нужный пункт:", buttons=get_main_menu())
-
-@client.on(events.CallbackQuery(pattern=b'sel_'))
-async def select_profile_cb(event):
-    phone = event.data.decode().replace("sel_", "")
-    await event.edit(f"✅ Аккаунт **{phone}** выбран для работы!")
-
-@client.on(events.NewMessage(pattern=lambda e: e.raw_text == '👥 Группы'))
-async def groups_menu(event):
-    user_id = event.sender_id
-    session_files = glob.glob(f"session_{user_id}_*.session")
-    
-    if not session_files:
-        await event.respond("⚠️ Сначала добавьте хотя бы один аккаунт через раздел **«👤 Профили»**!", buttons=get_main_menu())
+# Перехват файла для хостинга
+@client.on(events.NewMessage)
+async def handle_file_upload(event):
+    if not event.is_private:
         return
 
-    await event.respond("🔍 Анализирую чаты с подключенных аккаунтов... Пожалуйста, подождите.")
+    user_id = event.sender_id
+    state_data = user_states.get(user_id)
+    
+    if not state_data or state_data.get('step') != 'waiting_bot_file':
+        return
 
-    try:
-        all_groups = set()
-        for sf in session_files:
-            session_name = sf.replace(".session", "")
-            user_client = TelegramClient(session_name, API_ID, API_HASH)
-            await user_client.connect()
-            
-            if await user_client.is_user_authorized():
-                async for dialog in user_client.iter_dialogs():
-                    if dialog.is_group or dialog.is_channel:
-                        entity = dialog.entity
-                        if hasattr(entity, 'megagroup') and entity.megagroup or dialog.is_group:
-                            all_groups.add(dialog.title)
-            await user_client.disconnect()
+    # Проверяем, прислал ли пользователь файл
+    if event.document:
+        file_name = event.document.attributes[0].file_name if hasattr(event.document.attributes[0], 'file_name') else f"bot_{user_id}.py"
+        
+        if not file_name.endswith('.py'):
+            await event.respond("❌ Пожалуйста, отправьте файл с расширением `.py`!")
+            return
 
-        if all_groups:
-            text = "📋 **Найденные группы:**\n\n" + "\n".join([f"• {g}" for g in list(all_groups)[:30]])
-        else:
-            text = "📋 На подключенных аккаунтах не найдено групп."
+        # Создаем папку для пользовательских ботов, если её нет
+        os.makedirs("hosted_bots", exist_ok=True)
+        file_path = os.path.join("hosted_bots", f"user_{user_id}_{file_name}")
 
-        await event.respond(text, buttons=get_main_menu())
+        # Скачиваем файл (он принудительно перезапишет старый файл, если он там был)
+        await event.client.download_media(event.message, file=file_path)
 
-    except Exception as e:
-        await event.respond(f"❌ Ошибка при сканировании: {e}", buttons=get_main_menu())
-
-@client.on(events.NewMessage(pattern=lambda e: e.raw_text == '⚙️ Настройки'))
-async def settings_menu(event):
-    await event.respond("⚙️ Системные настройки.", buttons=get_main_menu())
-
-@client.on(events.NewMessage(pattern=lambda e: e.raw_text == '⚡ Рассылка'))
-async def mailing_menu(event):
-    await event.respond("⚡ Меню управления рассылкой.", buttons=get_main_menu())
-
-@client.on(events.NewMessage)
-async def handle_auth_steps(event):
-    if event.is_private and event.raw_text:
-        user_id = event.sender_id
-        state = user_states.get(user_id, {}).get('step')
-
-        if state == 'waiting_phone':
-            phone = event.raw_text.strip()
-            user_states[user_id]['phone'] = phone
-            
-            session_name = f"session_{user_id}_{phone}"
-            user_client = TelegramClient(session_name, API_ID, API_HASH)
-            await user_client.connect()
-            
+        # 1. Останавливаем старый процесс этого бота, если он работал
+        if user_id in active_bot_processes:
             try:
-                sent = await user_client.send_code_request(phone)
-                user_states[user_id]['client'] = user_client
-                user_states[user_id]['phone_code_hash'] = sent.phone_code_hash
-                user_states[user_id]['step'] = 'waiting_code'
-                await event.respond("✅ Код отправлен в Telegram этого аккаунта!\nВведите полученный код подтверждения:")
-            except Exception as e:
-                await event.respond(f"❌ Ошибка отправки кода: {e}\nПопробуйте снова через раздел «Профили».")
-                user_states.pop(user_id, None)
+                active_bot_processes[user_id].terminate()
+                active_bot_processes[user_id].wait()
+            except Exception:
+                pass
 
-        elif state == 'waiting_code':
-            code = event.raw_text.strip()
-            phone = user_states[user_id]['phone']
-            code_hash = user_states[user_id]['phone_code_hash']
-            user_client = user_states[user_id]['client']
+        # 2. Запускаем новый файл свежей версии
+        try:
+            process = subprocess.Popen(["python", file_path])
+            active_bot_processes[user_id] = process
             
-            try:
-                await user_client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
-                await user_client.disconnect()
-                user_states.pop(user_id, None)
-                await event.respond(f"🎉 **Аккаунт {phone} успешно добавлен!**", buttons=get_main_menu())
-            except Exception as e:
-                if "A password is required" in str(e):
-                    user_states[user_id]['step'] = 'waiting_password'
-                    await event.respond("🔒 Требуется двухэтапная аутентификация (облачный пароль). Введите пароль:")
-                else:
-                    await event.respond(f"❌ Ошибка авторизации: {e}\nПопробуйте начать заново.")
-                    await user_client.disconnect()
-                    user_states.pop(user_id, None)
+            user_states.pop(user_id, None)
+            await event.respond(
+                f"✅ **Успешно!** Файл `{file_name}` принят, перезаписан и запущен на автохосте.\nСтарые процессы обновлены.",
+                buttons=get_main_menu()
+            )
+        except Exception as e:
+            await event.respond(f"❌ Ошибка при запуске скрипта: {e}", buttons=get_main_menu())
+    else:
+        await event.respond("⚠️ Пожалуйста, отправьте именно файл скрипта (`.py`), а не текст.")
 
-        elif state == 'waiting_password':
-            password = event.raw_text.strip()
-            phone = user_states[user_id]['phone']
-            user_client = user_states[user_id]['client']
-            
-            try:
-                await user_client.sign_in(password=password)
-                await user_client.disconnect()
-                user_states.pop(user_id, None)
-                await event.respond(f"🎉 **Аккаунт {phone} успешно добавлен (2FA пройден)!**", buttons=get_main_menu())
-            except Exception as e:
-                await event.respond(f"❌ Неверный пароль: {e}\nПопробуйте заново через меню «Профили».")
-                await user_client.disconnect()
-                user_states.pop(user_id, None)
+@client.on(events.NewMessage(pattern=lambda e: e.raw_text in ['👤 Профили', '⚡ Рассылка', '💬 Сообщения', '👥 Группы', '⚙️ Настройки', '💎 Подписка', '❓ Поддержка', '🛠 Админ-панель']))
+async def other_menus(event):
+    user_id = event.sender_id
+    user_states.pop(user_id, None)
+    text = event.raw_text
+    await event.respond(f"🛠 Раздел **{text}** в разработке.", buttons=get_main_menu())
 
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    logging.info("--- АВТОХОСТ УСПЕШНО ЗАПУЩЕН ---")
+    logging.info("--- АВТОХОСТ CISAUTO УСПЕШНО ЗАПУЩЕН ---")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
